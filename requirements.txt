@@ -2,3 +2,4 @@ pgserver==0.1.4
 psycopg[binary]==3.3.6
 openai==3.42.0
 python-dotenv
+pytest

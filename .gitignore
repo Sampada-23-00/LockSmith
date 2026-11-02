@@ -3,3 +3,4 @@ pgdata/
 workspace/
 __pycache__/
 .env
+usage.json

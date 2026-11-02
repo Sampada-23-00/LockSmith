@@ -1,4 +1,4 @@
-"""Known-good fix used to sanity-check the stress harness: lock both rows in id order."""
+"""Reference fix: lock both rows in one statement, in id order."""
 import psycopg
 
 
