@@ -1,0 +1,5 @@
+.venv/
+pgdata/
+workspace/
+__pycache__/
+.env
