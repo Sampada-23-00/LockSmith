@@ -1,8 +1,10 @@
-"""LockSmith agent: diagnose -> fix -> get an independent verdict, using Muse Spark tool calling.
+"""LockSmith agent: diagnose -> reproduce -> fix -> get an independent verdict, using Muse Spark.
 
-The agent never decides whether its fix works. It can ask the harness for feedback on
-practice seeds as often as it likes, but submit_fix triggers a fresh verification on
-held-out seeds it has never seen, and only that verdict counts.
+The agent never decides whether its fix works. Before fixing, it must write its own
+reproduction test, which the harness only trusts if it catches the bug in the original
+code every time and never fires on a correct implementation. It can ask for feedback
+on practice seeds as often as it likes, but submit_fix triggers a fresh verification on
+held-out seeds it has never seen, plus its own reproduction test, and only that verdict counts.
 
 Usage: python -m locksmith.agent <scenario>
 """
@@ -14,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from locksmith import budget, db, harness, logs
+from locksmith import budget, db, harness, logs, repro
 from locksmith.scenarios import SCENARIOS, Scenario
 
 load_dotenv(db.ROOT / ".env")
@@ -29,16 +31,27 @@ Workflow:
 1. Call read_incident to see the production report and evidence from a load test of the current code.
 2. Read the service code and schema with list_files and read_file.
 3. Explain the root cause: which concurrent interleaving breaks which money rule.
-4. Write a complete replacement for service.py with write_candidate.
+4. Prove it before fixing anything: write a reproduction test with write_repro and check it with run_repro.
+   The file must define `def reproduce(connect, service) -> str | None`:
+   - `connect()` returns a new autocommit connection (each query has ~2 ms network latency; usable as
+     `with connect() as conn:`). Use one connection per thread and close them when done.
+   - `service` is the module under test; call its functions with your connections.
+   - The database is freshly reset before each call (64 accounts, ids 1..64, see schema.sql for the start
+     state). Use threading.Barrier to start requests at the same instant so the race happens every time.
+   - Return a short description of the money rule that broke, or None if everything held. Catch the
+     exceptions you expect (for example psycopg.errors.DeadlockDetected) instead of letting them escape.
+   run_repro accepts the test only if it catches the bug on every run against the original code and never
+   reports a problem against a correct implementation. Iterate until it is valid.
+5. Write a complete replacement for service.py with write_candidate.
    - Keep every function signature, return value and exception exactly as before; one request at a time,
      your version must behave identically to the original.
    - Fix the concurrency bug without serialising unrelated requests (no table locks or global locks):
      throughput is measured.
    - Do not rely on SERIALIZABLE or NOWAIT unless you also retry, because errors count as failures.
    - If you need schema changes (for example a unique index), define MIGRATIONS = [sql, ...] in service.py.
-5. Call run_verification for feedback. If any check fails, read why, revise and test again.
-6. When verification passes, call submit_fix. An independent verifier re-tests on unseen workloads and
-   decides; if it rejects the fix, keep working.
+6. Call run_verification for feedback. If any check fails, read why, revise and test again.
+7. When verification passes, call submit_fix. An independent verifier re-tests on unseen workloads and
+   runs your reproduction test against the fix; if it rejects the fix, keep working.
 Never claim a fix works unless submit_fix accepted it."""
 
 TOOLS = [
@@ -60,6 +73,23 @@ TOOLS = [
         "name": "read_file",
         "description": "Read a file of the service, by a name list_files returned.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    },
+    {
+        "type": "function",
+        "name": "write_repro",
+        "description": "Save a reproduction test (a Python file defining reproduce(connect, service)). Returns a test id.",
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "full Python source of the test"}},
+            "required": ["code"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "run_repro",
+        "description": "Check a reproduction test: it must catch the bug in the original code on every run and "
+        "never report a problem against a correct implementation.",
+        "parameters": {"type": "object", "properties": {"repro_id": {"type": "string"}}, "required": ["repro_id"]},
     },
     {
         "type": "function",
@@ -98,7 +128,7 @@ TOOLS = [
 # These tools only fail if our own infrastructure (Postgres, harness) is broken. Candidate
 # bugs are reported inside their results, so an exception here means: stop, don't let the
 # model spend tokens retrying something it cannot fix.
-HARNESS_TOOLS = {"read_incident", "run_verification", "submit_fix"}
+HARNESS_TOOLS = {"read_incident", "run_repro", "run_verification", "submit_fix"}
 
 
 class InfrastructureError(RuntimeError):
@@ -114,6 +144,9 @@ class Session:
         self.workspace = WORKSPACE / scenario.name
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.candidates: dict[str, Path] = {}
+        self.repros: dict[str, Path] = {}
+        self.valid_repro: str | None = None
+        self.repro_reports: dict[str, dict] = {}
         self.accepted: dict | None = None
 
     def read_incident(self):
@@ -132,6 +165,20 @@ class Session:
             raise ValueError(f"no such file: {name}")
         return path.read_text(encoding="utf-8")
 
+    def write_repro(self, code):
+        repro_id = f"r{len(self.repros) + 1}"
+        path = self.workspace / f"{repro_id}_repro.py"
+        path.write_text(code, encoding="utf-8")
+        self.repros[repro_id] = path
+        return {"repro_id": repro_id}
+
+    def run_repro(self, repro_id):
+        report = repro.evaluate(self.scenario.name, self.repros[repro_id])
+        self.repro_reports[repro_id] = report
+        if report["valid"]:
+            self.valid_repro = repro_id
+        return report
+
     def write_candidate(self, code):
         candidate_id = f"c{len(self.candidates) + 1}"
         path = self.workspace / f"{candidate_id}_service.py"
@@ -143,12 +190,19 @@ class Session:
         return harness.verify(self.scenario.name, self.candidates[candidate_id], harness.PRACTICE_SEEDS)
 
     def submit_fix(self, candidate_id, root_cause, fix):
-        verdict = harness.verify(self.scenario.name, self.candidates[candidate_id], harness.HOLDOUT_SEEDS)
+        if self.valid_repro is None:
+            return {"accepted": False, "reason": "first write a reproduction test that run_repro reports as valid"}
+        candidate = self.candidates[candidate_id]
+        verdict = harness.verify(self.scenario.name, candidate, harness.HOLDOUT_SEEDS)
+        verdict["checks"].append(repro.check_candidate(self.scenario.name, candidate, self.repros[self.valid_repro]))
+        verdict["passed"] = all(c["passed"] for c in verdict["checks"])
         if not verdict["passed"]:
             return {"accepted": False, "verdict": verdict}
         self.accepted = {
             "candidate_id": candidate_id,
-            "path": str(self.candidates[candidate_id]),
+            "path": str(candidate),
+            "repro_path": str(self.repros[self.valid_repro]),
+            "repro_report": self.repro_reports[self.valid_repro],
             "root_cause": root_cause,
             "fix": fix,
             "verdict": verdict,
@@ -171,7 +225,8 @@ class Session:
 
 def run(scenario_name: str, on_event=print) -> Session:
     db.uri()  # make sure Postgres is up before spending any tokens
-    client = OpenAI(base_url="https://api.meta.ai/v1", api_key=os.environ["MODEL_API_KEY"])
+    # Retries with backoff cover dropped connections; the budget is still checked on every call
+    client = OpenAI(base_url="https://api.meta.ai/v1", api_key=os.environ["MODEL_API_KEY"], max_retries=5)
     session = Session(SCENARIOS[scenario_name], on_event)
     request = dict(model=MODEL, instructions=SYSTEM_PROMPT, tools=TOOLS, max_output_tokens=MAX_OUTPUT_TOKENS)
 

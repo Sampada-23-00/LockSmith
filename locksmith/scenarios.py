@@ -44,6 +44,11 @@ class Scenario:
     def schema_sql(self) -> str:
         return (self.target_dir / "schema.sql").read_text(encoding="utf-8")
 
+    @property
+    def reference_path(self) -> Path:
+        """A known-correct implementation, used only to check that tests don't raise false alarms."""
+        return db.ROOT / "tests" / "reference_fixes" / f"{self.name}.py"
+
 
 def balances(conn: psycopg.Connection) -> dict[int, int]:
     return dict(conn.execute("SELECT id, balance FROM accounts").fetchall())

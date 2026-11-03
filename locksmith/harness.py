@@ -55,6 +55,12 @@ class NetworkConnection:
     def __getattr__(self, name):
         return getattr(self._conn, name)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._conn.close()
+
 
 def load_service(path: Path):
     spec = importlib.util.spec_from_file_location(f"service_{next(_module_counter)}", path)

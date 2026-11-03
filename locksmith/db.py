@@ -22,7 +22,7 @@ def server():
     while True:
         try:
             return pgserver.get_server(PGDATA, cleanup_mode=None)
-        except AssertionError:
+        except (AssertionError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
             if time.monotonic() > deadline:
                 break
             time.sleep(3)
