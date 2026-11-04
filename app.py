@@ -305,8 +305,8 @@ with tab_live:
     spent = budget.spent()
     daily, total = budget.limits()
     st.caption(
-        f"Calls Muse Spark (about $0.05 per bug). Spent today ${spent['today_usd']:.2f} of ${daily:.2f}, "
-        f"total ${spent['total_usd']:.2f} of ${total:.2f}. Takes 2–5 minutes."
+        f"Calls Muse Spark (about \\$0.08 per bug). Spent today \\${spent['today_usd']:.2f} of \\${daily:.2f}, "
+        f"total \\${spent['total_usd']:.2f} of \\${total:.2f}. Takes 2–5 minutes."
     )
     if st.button("Run the agent on this bug"):
         live = st.container(border=True)

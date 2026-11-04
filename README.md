@@ -115,10 +115,10 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 copy .env.example .env   # then add your MODEL_API_KEY
 
-.\.venv\Scripts\python -m locksmith.harness baseline           # reproduce all four bugs (no API needed)
+.\.venv\Scripts\python -m locksmith.harness baseline           # reproduce all six bugs (no API needed)
 .\.venv\Scripts\python -m pytest -q tests                      # prove the verifier is trustworthy
 .\.venv\Scripts\python -m locksmith.agent overdraft            # let the agent fix one
-.\.venv\Scripts\python -m locksmith.benchmark                  # run the agent on all four, results in results/
+.\.venv\Scripts\python -m locksmith.benchmark                  # run the agent on all six, results in results/
 ```
 
 Postgres runs embedded via `pgserver`, so nothing needs installing. API spend is capped per day and in total by `locksmith/budget.py`.
