@@ -1,0 +1,100 @@
+{
+  "scenario": "deadlock",
+  "title": "Deadlock in money transfers",
+  "model": "muse-spark-1.3",
+  "finished_at": "2026-11-04T09:54:18",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 152.6,
+  "cost_usd": 0.0567,
+  "root_cause": "transfer() locked sender row then receiver row (SELECT ... FOR UPDATE). Two concurrent transfers in opposite directions (1->2 and 2->1) each hold one row lock and wait for the other, forming a wait cycle: a classic lock-ordering deadlock, confirmed by Postgres logs showing transactions blocked on each other's ShareLock for the SELECT FOR UPDATE statements.",
+  "fix": "Lock the two account rows in a consistent global order (ascending id) instead of sender-then-receiver, so opposite-direction transfers acquire locks in the same order and cannot deadlock. Behaviour per request is unchanged.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "opposite transfers deadlocked (14 deadlock failures)",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "deadlock",
+    "candidate": "workspace\\deadlock\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.23,
+          "throughput_ops_per_s": 148.6,
+          "p95_latency_ms": 223.18
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.139,
+          "throughput_ops_per_s": 152.9,
+          "p95_latency_ms": 223.75
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.519,
+          "throughput_ops_per_s": 136.4,
+          "p95_latency_ms": 260.36
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1001.4,
+          "fix_ops_per_s": 927.6,
+          "ratio": 0.93,
+          "required_ratio": 0.5,
+          "original_p95_ms": 14.38,
+          "fix_p95_ms": 15.59
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 12.6
+  },
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    N_each = 8\n    N = N_each * 2\n    barrier = threading.Barrier(N)\n    deadlocks = []\n    lock = threading.Lock()\n\n    def worker(from_id, to_id):\n        try:\n            with connect() as conn:\n                try:\n                    barrier.wait(timeout=10)\n                except Exception:\n                    return\n                try:\n                    service.transfer(conn, from_id, to_id, 1)\n                except Exception as e:\n                    msg = f\"{type(e).__name__}: {e}\".lower()\n                    if \"deadlock\" in msg:\n                        with lock:\n                            deadlocks.append(str(e))\n                    # ignore other expected errors like InsufficientFunds for this repro\n                    # but deadlock string check covers DeadlockDetected\n                    try:\n                        import psycopg.errors as pgerr\n                        if isinstance(e, pgerr.DeadlockDetected):\n                            with lock:\n                                if not deadlocks:\n                                    deadlocks.append(str(e))\n                    except Exception:\n                        pass\n        except Exception:\n            pass\n\n    threads = []\n    for i in range(N_each):\n        threads.append(threading.Thread(target=worker, args=(1, 2)))\n        threads.append(threading.Thread(target=worker, args=(2, 1)))\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join(timeout=30)\n\n    if deadlocks:\n        return f\"opposite transfers deadlocked ({len(deadlocks)} deadlock failures)\"\n    return None\n",
+  "fix_code": "\"\"\"Money transfer service.\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef transfer(conn: psycopg.Connection, from_id: int, to_id: int, amount: int) -> None:\n    with conn.transaction():\n        if from_id == to_id:\n            row = conn.execute(\n                \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (from_id,)\n            ).fetchone()\n            if row is None:\n                raise ValueError(\"unknown account\")\n            if row[0] < amount:\n                raise InsufficientFunds(from_id)\n            conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, from_id))\n            conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, to_id))\n            return\n        # Lock rows in a consistent global order (ascending id) to avoid\n        # deadlocks when concurrent transfers run in opposite directions.\n        first_id, second_id = (from_id, to_id) if from_id < to_id else (to_id, from_id)\n        first_row = conn.execute(\n            \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (first_id,)\n        ).fetchone()\n        second_row = conn.execute(\n            \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (second_id,)\n        ).fetchone()\n\n        if first_row is None or second_row is None:\n            raise ValueError(\"unknown account\")\n\n        if from_id < to_id:\n            sender_balance = first_row[0]\n        else:\n            sender_balance = second_row[0]\n\n        if sender_balance < amount:\n            raise InsufficientFunds(from_id)\n\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, from_id))\n        conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, to_id))\n"
+}

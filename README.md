@@ -21,20 +21,25 @@ AI coding agents verify fixes by rerunning tests. Concurrency bugs only appear u
 
 Each buggy service lives in `benchmark/<scenario>/` (what the agent may read and replace). Workloads and money checks live in `locksmith/scenarios.py` (never shown to the agent).
 
-## Results (Muse Spark 1.3, no hints in the code)
+## Results (no hints in the code)
 
-| Bug | Reproduction tests written | Fix attempts | Independent verdict | Cost |
+| Model | Runs | Accepted | Mean cost / bug | Mean time / bug |
 |---|---|---|---|---|
-| Deadlock | 3 (first two rejected as unreliable) | 1 | accepted (6/6 checks) | $0.15 |
-| Lost update | 2 | 1 | accepted (6/6 checks) | $0.16 |
-| Overdraft | 2 | 1 | accepted (6/6 checks) | $0.18 |
-| Double spend | 1 | 1 | accepted (6/6 checks) | $0.05 |
-| Household overdraft (write skew) | 1 | 1 | accepted (6/6 checks) | $0.07 |
-| Daily limit bypass (phantom) | 1 | 1 | accepted (6/6 checks) | $0.07 |
+| Muse Spark 1.3 | 18 (6 bugs × 3) | **18/18** | $0.08 | 2.6 min |
+| Muse Wonder 1.0 | 6 (6 bugs × 1) | **6/6** | $0.22 | 2.6 min |
 
-6/6 bugs fixed autonomously for **$0.69** in total. The benchmark services carry no comments describing their bugs. Full transcripts, the agent's tests and fixes are in `results/`.
+| Bug | Spark accepted | Mean reproduction tests written | Mean fixes written |
+|---|---|---|---|
+| Deadlock | 3/3 | 1.67 | 1 |
+| Lost update | 3/3 | 1.33 | 1 |
+| Overdraft | 3/3 | 1.67 | 1 |
+| Double spend | 3/3 | 1 | 1 |
+| Household overdraft (write skew) | 3/3 | 1 | 1 |
+| Daily limit bypass (phantom) | 3/3 | 1 | 1.67 |
 
-The two harder bugs have an obvious fix that is wrong, and the verifier rejects both: locking the partner's account too deadlocks under load, and locking today's withdrawal rows cannot stop new rows from being inserted. The agent avoided both.
+What the verifier did across all 24 runs: it **rejected 4 of 28 agent-written reproduction tests** as unreliable, and the agent wrote better ones. No candidate fix failed verification, so the fix verdicts above were all passes. The benchmark services carry no comments describing their bugs. Costs are estimated from token counts and published prices. Transcripts, tests and fixes are in `results/`; `results/summary.json` has the aggregate.
+
+The two harder bugs have an obvious fix that is wrong, and the verifier rejects both: locking the partner's account too deadlocks under load, and locking today's withdrawal rows cannot stop new rows from being inserted. The agent avoided both in every run. These rejections are demonstrated with hand-written trap fixes in `tests/bad_fixes/`, and live in the dashboard.
 
 ## How the agent works (Muse Spark, tool calling)
 
@@ -101,7 +106,7 @@ LockSmith today is a working prototype on six self-contained services. This is h
 
 **Can the agent game the verifier?** It never sees the workloads, the money checks or the held-out seeds, cannot read the harness code, and its own reproduction test must fail on the original code and pass on a correct implementation before it counts.
 
-**What does it cost?** About $0.12 (roughly ₹10) per bug with Muse Spark, measured in `results/`.
+**What does it cost?** About $0.08 (roughly ₹7) per bug with Muse Spark, averaged over 18 runs in `results/`.
 
 ## Quick start
 

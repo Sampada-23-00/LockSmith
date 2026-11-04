@@ -1,0 +1,100 @@
+{
+  "scenario": "daily_limit",
+  "title": "Daily withdrawal limit bypass (phantom)",
+  "model": "muse-spark-1.3",
+  "finished_at": "2026-11-04T09:51:44",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 3,
+  "verification_runs": 2,
+  "submissions": 1,
+  "seconds": 170.3,
+  "cost_usd": 0.0883,
+  "root_cause": "withdraw() does check-then-insert without any lock: it reads SUM(amount) for today and, if under DAILY_LIMIT, inserts. Under READ COMMITTED two concurrent transactions both read the same stale sum, both pass the check, and both insert, so the day total exceeds DAILY_LIMIT (lost-update / phantom race).",
+  "fix": "Serialize withdrawals per account with SELECT ... FOR UPDATE on the accounts row at the start of the transaction, making the SUM check + INSERT + balance update atomic per account while leaving different accounts fully parallel.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "account 1 withdrew 6000 today, above the daily limit of 5000",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "daily_limit",
+    "candidate": "workspace\\daily_limit\\c3_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 20,
+          "rejected": 460,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.55,
+          "throughput_ops_per_s": 872.8,
+          "p95_latency_ms": 25.68
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 20,
+          "rejected": 460,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.551,
+          "throughput_ops_per_s": 870.7,
+          "p95_latency_ms": 31.28
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 21,
+          "rejected": 459,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.574,
+          "throughput_ops_per_s": 836.1,
+          "p95_latency_ms": 33.66
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1147.9,
+          "fix_ops_per_s": 1004.7,
+          "ratio": 0.88,
+          "required_ratio": 0.5,
+          "original_p95_ms": 14.76,
+          "fix_p95_ms": 15.36
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 3.9
+  },
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    N = 6\n    AMOUNT = 1000\n    ACCOUNT = 1\n    barrier = threading.Barrier(N)\n    errors = []\n\n    def worker():\n        try:\n            barrier.wait(timeout=10)\n        except Exception as e:\n            return\n        try:\n            with connect() as conn:\n                try:\n                    service.withdraw(conn, ACCOUNT, AMOUNT)\n                except service.DailyLimitExceeded:\n                    pass\n                except Exception:\n                    # catch ValueError, psycopg errors (e.g. check violation) so test doesn't escape\n                    pass\n        except Exception:\n            pass\n\n    threads = [threading.Thread(target=worker) for _ in range(N)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join(timeout=30)\n\n    # read total withdrawn today for the account\n    try:\n        with connect() as conn:\n            with conn.cursor() as cur:\n                cur.execute(\"SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE account_id=%s AND day=current_date\", (ACCOUNT,))\n                row = cur.fetchone()\n                total = int(row[0]) if row else 0\n    except Exception as e:\n        return None\n    limit = getattr(service, \"DAILY_LIMIT\", 5000)\n    if total > limit:\n        return f\"account {ACCOUNT} withdrew {total} today, above the daily limit of {limit}\"\n    return None\n",
+  "fix_code": "\"\"\"ATM / UPI withdrawals with a per-account daily limit.\n\nEach account may withdraw at most DAILY_LIMIT paise per calendar day.\n\"\"\"\nimport psycopg\n\nDAILY_LIMIT = 5_000  # \u20b950 per day\n\nMIGRATIONS: list[str] = []\n\n\nclass DailyLimitExceeded(Exception):\n    pass\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        # Serialize concurrent withdrawals for the same account so the\n        # check-then-insert below is atomic: lock the account row first.\n        # Different accounts lock different rows and proceed in parallel.\n        # For an unknown account no row is locked and execution falls\n        # through to the original statements below, preserving the\n        # original error behaviour exactly.\n        conn.execute(\n            \"SELECT 1 FROM accounts WHERE id = %s FOR UPDATE\",\n            (account_id,),\n        ).fetchone()\n        (used,) = conn.execute(\n            \"SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE account_id = %s AND day = current_date\",\n            (account_id,),\n        ).fetchone()\n        if used + amount > DAILY_LIMIT:\n            raise DailyLimitExceeded(account_id)\n        conn.execute(\"INSERT INTO withdrawals (account_id, amount) VALUES (%s, %s)\", (account_id, amount))\n        updated = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s WHERE id = %s RETURNING id\", (amount, account_id)\n        ).fetchone()\n        if updated is None:\n            raise ValueError(\"unknown account\")\n"
+}

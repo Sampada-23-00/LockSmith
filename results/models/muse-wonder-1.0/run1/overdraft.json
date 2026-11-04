@@ -1,0 +1,100 @@
+{
+  "scenario": "overdraft",
+  "title": "Overdraft race in withdrawals",
+  "model": "muse-wonder-1.0",
+  "finished_at": "2026-11-04T10:11:18",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 138.6,
+  "cost_usd": 0.2045,
+  "root_cause": "Classic check-then-act (TOCTOU) race in withdraw: a plain SELECT reads the balance, the Python code checks row[0] < amount, then a separate UPDATE deducts. Two concurrent withdrawals on the same account both read the same pre-deduction balance (e.g. 1000), both pass the check for a 600 withdrawal, and both UPDATE, driving the balance to -200. The check was evaluated on a stale snapshot outside any lock on the account row, so the no-overdraft invariant was not enforced atomically.",
+  "fix": "Replaced withdraw's separate SELECT-check-then-UPDATE with one atomic UPDATE ... SET balance = balance - %s WHERE id = %s AND balance >= %s RETURNING balance. The predicate is evaluated under the row lock held by the UPDATE, so a second concurrent withdrawal re-checks the updated balance and matches no row. When no row is updated, a follow-up SELECT distinguishes an unknown account (ValueError) from insufficient funds (InsufficientFunds), preserving exact signatures, return values and exceptions. No schema changes, no table/global locks, no SERIALIZABLE/NOWAIT: different accounts use different rows and proceed in parallel.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "overdraft: account 1 balance -3800 after 8 concurrent withdrawals of 600 from 1000",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "overdraft",
+    "candidate": "workspace\\overdraft\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 431,
+          "rejected": 49,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.308,
+          "throughput_ops_per_s": 1557.5,
+          "p95_latency_ms": 7.71
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 409,
+          "rejected": 71,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.326,
+          "throughput_ops_per_s": 1473.1,
+          "p95_latency_ms": 8.76
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 445,
+          "rejected": 35,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.293,
+          "throughput_ops_per_s": 1637.1,
+          "p95_latency_ms": 7.76
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1351.2,
+          "fix_ops_per_s": 1523.9,
+          "ratio": 1.13,
+          "required_ratio": 0.5,
+          "original_p95_ms": 9.6,
+          "fix_p95_ms": 7.58
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 2.7
+  },
+  "repro_code": "import threading\n\n\ndef reproduce(connect, service):\n    # Race many concurrent withdrawals against the same account.\n    # Start balance is fixed at 1000, each withdrawal is 600, so at most\n    # one can legitimately succeed and the balance can never go below 0.\n    for account_id in range(1, 11):\n        try:\n            with connect() as conn:\n                conn.execute(\n                    \"UPDATE accounts SET balance = 1000 WHERE id = %s\",\n                    (account_id,),\n                )\n        except Exception:\n            continue\n\n        n = 12\n        barrier = threading.Barrier(n)\n        outcomes = []\n        lock = threading.Lock()\n\n        def worker():\n            try:\n                with connect() as conn:\n                    try:\n                        barrier.wait(timeout=15)\n                    except Exception:\n                        pass\n                    try:\n                        service.withdraw(conn, account_id, 600)\n                        with lock:\n                            outcomes.append(\"ok\")\n                    except service.InsufficientFunds:\n                        with lock:\n                            outcomes.append(\"insufficient\")\n                    except Exception as exc:  # expected service/psycopg errors only noted\n                        with lock:\n                            outcomes.append(f\"other:{exc!r}\")\n            except Exception as exc:\n                with lock:\n                    outcomes.append(f\"conn:{exc!r}\")\n\n        threads = [threading.Thread(target=worker) for _ in range(n)]\n        for t in threads:\n            t.start()\n        for t in threads:\n            t.join(timeout=20)\n\n        try:\n            with connect() as conn:\n                row = conn.execute(\n                    \"SELECT balance FROM accounts WHERE id = %s\",\n                    (account_id,),\n                ).fetchone()\n        except Exception:\n            continue\n        if row is None:\n            continue\n        final = row[0]\n        ok_count = outcomes.count(\"ok\")\n        if final < 0:\n            return (\n                f\"overdraft: account {account_id} balance {final} after \"\n                f\"{ok_count} concurrent withdrawals of 600 from 1000\"\n            )\n        if ok_count > 1:\n            return (\n                f\"overdraft: account {account_id} allowed {ok_count} \"\n                f\"withdrawals of 600 from 1000, balance {final}\"\n            )\n    return None\n",
+  "fix_code": "\"\"\"Withdrawal service for accounts without an overdraft facility.\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef deposit(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, account_id))\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        # Atomic check-and-debit: the balance predicate is evaluated while\n        # holding the row lock acquired by the UPDATE, so concurrent\n        # withdrawals on the same account cannot both pass a stale check.\n        # Withdrawals on different accounts touch different rows and are\n        # not serialised against each other.\n        row = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s \"\n            \"WHERE id = %s AND balance >= %s RETURNING balance\",\n            (amount, account_id, amount),\n        ).fetchone()\n        if row is not None:\n            return\n        # No row updated: distinguish unknown account from insufficient\n        # funds, preserving the original exceptions.\n        row = conn.execute(\n            \"SELECT balance FROM accounts WHERE id = %s\", (account_id,)\n        ).fetchone()\n        if row is None:\n            raise ValueError(\"unknown account\")\n        raise InsufficientFunds(account_id)\n"
+}

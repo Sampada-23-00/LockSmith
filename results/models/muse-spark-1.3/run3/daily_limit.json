@@ -1,0 +1,100 @@
+{
+  "scenario": "daily_limit",
+  "title": "Daily withdrawal limit bypass (phantom)",
+  "model": "muse-spark-1.3",
+  "finished_at": "2026-11-04T10:04:20",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 134.2,
+  "cost_usd": 0.0649,
+  "root_cause": "Check-then-act race under READ COMMITTED: withdraw() does SELECT COALESCE(SUM(amount)) ... WHERE account_id AND day=current_date, checks used+amount <= DAILY_LIMIT, then INSERTs. Concurrent transactions all snapshot the same `used` value, all pass the check, and all insert, so the day's total exceeds DAILY_LIMIT (e.g. account withdrew ~6900 vs 5000 limit). No row/gap lock is held between the check and the insert.",
+  "fix": "Serialize same-account withdrawals with SELECT ... FROM accounts WHERE id = %s FOR UPDATE before the check-then-insert. Different accounts lock different rows so they proceed in parallel; no table/global locks, no SERIALIZABLE/NOWAIT.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "daily limit broken: account 1 withdrew 5500 today, above limit 5000 (n=20 x 500)",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "daily_limit",
+    "candidate": "workspace\\daily_limit\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 20,
+          "rejected": 460,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.557,
+          "throughput_ops_per_s": 861.4,
+          "p95_latency_ms": 25.46
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 20,
+          "rejected": 460,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.548,
+          "throughput_ops_per_s": 875.6,
+          "p95_latency_ms": 27.79
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 21,
+          "rejected": 459,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.551,
+          "throughput_ops_per_s": 871.0,
+          "p95_latency_ms": 25.85
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1061.8,
+          "fix_ops_per_s": 906.6,
+          "ratio": 0.85,
+          "required_ratio": 0.5,
+          "original_p95_ms": 14.85,
+          "fix_p95_ms": 17.33
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 4.0
+  },
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    # Find a usable amount: need per-txn amount <= DAILY_LIMIT but total attempted > limit\n    # and total attempted <= balance so balance CHECK doesn't interfere.\n    with connect() as conn:\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = 1\").fetchone()\n        balance = row[0] if row else 0\n    n = 20\n    # amount small enough to pass single check, large enough that n*amount > limit\n    # cap at 500, scale down if balance small\n    if balance >= n * 200:\n        amount = 500\n        # adjust to fit balance if needed\n        if balance < n * amount:\n            amount = max(1, balance // n)\n    else:\n        # very small balance fallback\n        amount = max(1, balance // n) if balance > 0 else 200\n        # ensure single amount doesn't exceed limit (else no concurrency bug possible)\n        if amount > service.DAILY_LIMIT:\n            amount = service.DAILY_LIMIT // 2\n    # ensure n*amount > DAILY_LIMIT, else adjust n\n    # if amount too small, increase n\n    limit = getattr(service, \"DAILY_LIMIT\", 5000)\n    if n * amount <= limit:\n        # need bigger total; try to keep within balance\n        # if balance allows, bump amount\n        if balance > limit:\n            amount = min(limit // 2, max(amount, (limit + n) // n + 1))\n            if balance < n * amount:\n                amount = max(1, balance // n)\n        # if still not exceeding, just use amount that exceeds (test may be inconclusive -> still try)\n        pass\n\n    barrier = threading.Barrier(n)\n    errors = []\n\n    def worker():\n        try:\n            barrier.wait(timeout=10)\n        except Exception:\n            pass\n        try:\n            with connect() as conn:\n                try:\n                    service.withdraw(conn, 1, amount)\n                except Exception as e:\n                    # expected: DailyLimitExceeded etc; also catch psycopg errors\n                    pass\n        except Exception as e:\n            pass\n\n    threads = [threading.Thread(target=worker) for _ in range(n)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join(timeout=30)\n\n    with connect() as conn:\n        (total,) = conn.execute(\"SELECT COALESCE(SUM(amount),0) FROM withdrawals WHERE account_id = 1\").fetchone()\n        # also check balance non-negative etc? main rule is daily limit\n    if total is not None and total > limit:\n        return f\"daily limit broken: account 1 withdrew {total} today, above limit {limit} (n={n} x {amount})\"\n    return None\n",
+  "fix_code": "\"\"\"ATM / UPI withdrawals with a per-account daily limit.\n\nEach account may withdraw at most DAILY_LIMIT paise per calendar day.\n\"\"\"\nimport psycopg\n\nDAILY_LIMIT = 5_000  # \u20b950 per day\n\nMIGRATIONS: list[str] = []\n\n\nclass DailyLimitExceeded(Exception):\n    pass\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        # Serialize concurrent withdrawals for the same account so the\n        # check-then-insert below is safe. Different accounts lock\n        # different rows and proceed in parallel. Result is intentionally\n        # ignored to preserve single-threaded behaviour exactly (e.g.\n        # unknown-account handling stays as before).\n        conn.execute(\n            \"SELECT 1 FROM accounts WHERE id = %s FOR UPDATE\",\n            (account_id,),\n        ).fetchone()\n        (used,) = conn.execute(\n            \"SELECT COALESCE(SUM(amount), 0) FROM withdrawals WHERE account_id = %s AND day = current_date\",\n            (account_id,),\n        ).fetchone()\n        if used + amount > DAILY_LIMIT:\n            raise DailyLimitExceeded(account_id)\n        conn.execute(\"INSERT INTO withdrawals (account_id, amount) VALUES (%s, %s)\", (account_id, amount))\n        updated = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s WHERE id = %s RETURNING id\", (amount, account_id)\n        ).fetchone()\n        if updated is None:\n            raise ValueError(\"unknown account\")\n"
+}

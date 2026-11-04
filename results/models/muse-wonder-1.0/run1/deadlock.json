@@ -1,0 +1,100 @@
+{
+  "scenario": "deadlock",
+  "title": "Deadlock in money transfers",
+  "model": "muse-wonder-1.0",
+  "finished_at": "2026-11-04T10:06:52",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 150.3,
+  "cost_usd": 0.197,
+  "root_cause": "transfer() locked rows in argument order: sender first then receiver (SELECT ... FOR UPDATE on from_id, then to_id). Two concurrent opposite-direction transfers between the same pair (A->B and B->A) each hold one row lock and block forever on the other, forming a lock-ordering cycle that PostgreSQL aborts with 'deadlock detected'. The deadlock reports confirm both sides wait on the same SELECT ... FOR UPDATE statement.",
+  "fix": "Acquire both row locks in a globally consistent ascending account-id order (lower id first) regardless of transfer direction, handling the self-transfer (from_id==to_id) case with a single lock. The funds check still uses the sender's locked balance and updates are unchanged, so sequential behaviour is identical. Disjoint account pairs lock disjoint rows, so unrelated transfers still run fully in parallel (no table/global locks, no SERIALIZABLE/NOWAIT retries needed).",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "opposite-direction transfers deadlocked: DeadlockDetected: deadlock detected\nDETAIL:  Process 23196 waits for ShareLock on transaction 390870; blocked by process 17644.\nProcess 17644 waits for ShareLock on transaction 390874; blocked by process 23196.\nHINT:  See server log for query details.\nCONTEXT:  while locking tuple (0,22) in relation \"accounts\"",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "deadlock",
+    "candidate": "workspace\\deadlock\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.683,
+          "throughput_ops_per_s": 130.3,
+          "p95_latency_ms": 272.05
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.146,
+          "throughput_ops_per_s": 152.6,
+          "p95_latency_ms": 248.57
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 3.317,
+          "throughput_ops_per_s": 144.7,
+          "p95_latency_ms": 256.59
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 955.9,
+          "fix_ops_per_s": 1068.3,
+          "ratio": 1.12,
+          "required_ratio": 0.5,
+          "original_p95_ms": 15.46,
+          "fix_p95_ms": 13.39
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 12.8
+  },
+  "repro_code": "import threading\n\n\ndef reproduce(connect, service) -> str | None:\n    deadlock_errors = []\n    other_errors = []\n    lock = threading.Lock()\n\n    def worker(from_id, to_id, barrier):\n        try:\n            with connect() as conn:\n                barrier.wait(timeout=15)\n                try:\n                    service.transfer(conn, from_id, to_id, 1)\n                except Exception as e:\n                    msg = f\"{type(e).__name__}: {e}\"\n                    with lock:\n                        if \"deadlock\" in msg.lower():\n                            deadlock_errors.append(msg)\n                        else:\n                            other_errors.append(msg)\n        except Exception as e:\n            msg = f\"{type(e).__name__}: {e}\"\n            with lock:\n                if \"deadlock\" in msg.lower():\n                    deadlock_errors.append(msg)\n                else:\n                    other_errors.append(msg)\n\n    # Several rounds of simultaneous opposite-direction transfers on\n    # disjoint account pairs. Each pair's two threads lock the two rows\n    # in opposite order in the buggy code, so at least one pair should\n    # deadlock on every run.\n    for _round in range(5):\n        pairs = [(i, i + 1) for i in range(1, 33, 2)]  # 16 disjoint pairs\n        barrier = threading.Barrier(2 * len(pairs))\n        threads = []\n        for a, b in pairs:\n            threads.append(threading.Thread(target=worker, args=(a, b, barrier)))\n            threads.append(threading.Thread(target=worker, args=(b, a, barrier)))\n        for t in threads:\n            t.start()\n        for t in threads:\n            t.join(timeout=30)\n        if deadlock_errors:\n            return (\n                \"opposite-direction transfers deadlocked: \"\n                + deadlock_errors[0]\n            )\n\n    if other_errors:\n        # No deadlock observed; do not claim the money/deadlock rule broke\n        # for unrelated errors in this repro.\n        return None\n    return None\n",
+  "fix_code": "\"\"\"Money transfer service.\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef transfer(conn: psycopg.Connection, from_id: int, to_id: int, amount: int) -> None:\n    with conn.transaction():\n        # Acquire row locks in a globally consistent (ascending id) order,\n        # regardless of transfer direction. Concurrent transfers between\n        # the same pair in opposite directions then request the locks in\n        # the same order, so no lock-ordering cycle (deadlock) can form.\n        # Transfers on disjoint accounts still lock disjoint rows and\n        # proceed fully in parallel.\n        if from_id == to_id:\n            row = conn.execute(\n                \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (from_id,)\n            ).fetchone()\n            if row is None:\n                raise ValueError(\"unknown account\")\n            if row[0] < amount:\n                raise InsufficientFunds(from_id)\n            conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, from_id))\n            conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, to_id))\n            return\n\n        if from_id < to_id:\n            first_id, second_id = from_id, to_id\n        else:\n            first_id, second_id = to_id, from_id\n\n        first = conn.execute(\n            \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (first_id,)\n        ).fetchone()\n        second = conn.execute(\n            \"SELECT balance FROM accounts WHERE id = %s FOR UPDATE\", (second_id,)\n        ).fetchone()\n\n        if first is None or second is None:\n            raise ValueError(\"unknown account\")\n\n        sender_balance = first[0] if from_id == first_id else second[0]\n        if sender_balance < amount:\n            raise InsufficientFunds(from_id)\n\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, from_id))\n        conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, to_id))\n"
+}

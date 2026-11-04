@@ -1,0 +1,100 @@
+{
+  "scenario": "lost_update",
+  "title": "Lost update in wallet top-ups",
+  "model": "muse-spark-1.3",
+  "finished_at": "2026-11-04T09:40:59",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 125.0,
+  "cost_usd": 0.0518,
+  "root_cause": "Lost update: deposit/withdraw did SELECT balance then UPDATE to a computed value with no locking. Two concurrent transactions read the same balance and the second overwrote the first, so some successful operations never affected the balance. Reconciliation (balance vs sum of successful ops) therefore drifted with no errors logged.",
+  "fix": "Replaced read-modify-write with atomic in-place UPDATEs: deposit uses UPDATE ... SET balance = balance + %s, withdraw uses UPDATE ... SET balance = balance - %s WHERE balance >= %s and maps rowcount 0 to unknown-account vs InsufficientFunds. The row lock from the UPDATE serializes concurrent writers on the same account without blocking other accounts.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "lost update: account 1 balance is 106800 but successful deposits add up to 148000 (initial 100000 + 480x100)",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "lost_update",
+    "candidate": "workspace\\lost_update\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.306,
+          "throughput_ops_per_s": 1567.2,
+          "p95_latency_ms": 8.45
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.311,
+          "throughput_ops_per_s": 1541.9,
+          "p95_latency_ms": 9.71
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.314,
+          "throughput_ops_per_s": 1528.8,
+          "p95_latency_ms": 9.09
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1219.9,
+          "fix_ops_per_s": 1541.9,
+          "ratio": 1.26,
+          "required_ratio": 0.5,
+          "original_p95_ms": 10.76,
+          "fix_p95_ms": 7.57
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 2.9
+  },
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    ACCOUNT_ID = 1\n    N_THREADS = 16\n    PER_THREAD = 30\n    AMOUNT = 100\n\n    with connect() as conn:\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (ACCOUNT_ID,)).fetchone()\n        initial = row[0]\n\n    barrier = threading.Barrier(N_THREADS)\n    successes = [0] * N_THREADS\n    threads = []\n\n    def worker(idx):\n        try:\n            barrier.wait()\n        except threading.BrokenBarrierError:\n            return\n        with connect() as conn:\n            cnt = 0\n            for _ in range(PER_THREAD):\n                try:\n                    service.deposit(conn, ACCOUNT_ID, AMOUNT)\n                    cnt += 1\n                except Exception:\n                    # deposit should not fail; ignore and don't count\n                    pass\n            successes[idx] = cnt\n\n    for i in range(N_THREADS):\n        t = threading.Thread(target=worker, args=(i,))\n        threads.append(t)\n        t.start()\n    for t in threads:\n        t.join()\n\n    total_ok = sum(successes)\n    expected = initial + total_ok * AMOUNT\n    with connect() as conn:\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (ACCOUNT_ID,)).fetchone()\n        final = row[0]\n\n    if final != expected:\n        return f\"lost update: account {ACCOUNT_ID} balance is {final} but successful deposits add up to {expected} (initial {initial} + {total_ok}x{AMOUNT})\"\n    return None\n",
+  "fix_code": "\"\"\"Wallet service: top-ups and spends on a customer's wallet.\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef _read_balance(conn: psycopg.Connection, account_id: int) -> int:\n    row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n    if row is None:\n        raise ValueError(\"unknown account\")\n    return row[0]\n\n\ndef deposit(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance + %s WHERE id = %s\",\n            (amount, account_id),\n        )\n        if cur.rowcount == 0:\n            raise ValueError(\"unknown account\")\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s WHERE id = %s AND balance >= %s\",\n            (amount, account_id, amount),\n        )\n        if cur.rowcount == 1:\n            return\n        row = conn.execute(\"SELECT 1 FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n        if row is None:\n            raise ValueError(\"unknown account\")\n        raise InsufficientFunds(account_id)\n"
+}
