@@ -2,21 +2,21 @@
   "scenario": "double_spend",
   "title": "Double charge on payment retries",
   "model": "muse-spark-1.3",
-  "finished_at": "2026-11-03T16:09:36",
+  "finished_at": "2026-11-03T16:36:41",
   "accepted": true,
   "aborted": null,
   "repro_attempts": 1,
   "fix_attempts": 1,
   "verification_runs": 1,
   "submissions": 1,
-  "seconds": 109.1,
-  "cost_usd": 0.0538,
-  "root_cause": "Check-then-insert race: pay() did SELECT to test the idempotency key then INSERT+UPDATE. Two concurrent retries of the same key both see no row and both insert and debit, charging the customer multiple times (TOCTOU, non-atomic without constraint/lock).",
-  "fix": "Added UNIQUE constraint on payments(idempotency_key) and replaced SELECT-then-INSERT with atomic INSERT ... ON CONFLICT DO NOTHING RETURNING: if a row was inserted this request charges the account and returns True, otherwise returns False. Otherwise identical behavior single-threaded, no locks/errors surviving load.",
+  "seconds": 120.8,
+  "cost_usd": 0.0545,
+  "root_cause": "pay() did check-then-act in READ COMMITTED: SELECT for the idempotency key, then INSERT + balance UPDATE. Concurrent retries with the same key all see no row and all insert/charge, so one purchase is charged N times. No UNIQUE constraint existed to stop duplicates.",
+  "fix": "Add UNIQUE constraint on payments(idempotency_key) and replace SELECT-then-INSERT with atomic INSERT ... ON CONFLICT DO NOTHING RETURNING so exactly one concurrent retry wins and charges once.",
   "repro_report": {
     "detects_bug_in_original_code": "3/3",
     "false_alarms_on_a_correct_implementation": "0/3",
-    "example_violation": "idempotency violated: payment repro-key-0 was charged 8 times (8 callers returned True), must be charged exactly once",
+    "example_violation": "idempotency violated: payment 'repro-idempotency-key' charged 15 times (expected 1); True returns=15/20, errors=0, balance=99985 init=100000",
     "errors": [],
     "valid": true
   },
@@ -40,9 +40,9 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.415,
-          "throughput_ops_per_s": 1157.1,
-          "p95_latency_ms": 12.61
+          "seconds": 0.401,
+          "throughput_ops_per_s": 1196.8,
+          "p95_latency_ms": 12.52
         }
       },
       {
@@ -55,9 +55,9 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.398,
-          "throughput_ops_per_s": 1206.2,
-          "p95_latency_ms": 11.08
+          "seconds": 0.412,
+          "throughput_ops_per_s": 1164.7,
+          "p95_latency_ms": 13.72
         }
       },
       {
@@ -70,21 +70,21 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.455,
-          "throughput_ops_per_s": 1055.0,
-          "p95_latency_ms": 12.73
+          "seconds": 0.389,
+          "throughput_ops_per_s": 1235.3,
+          "p95_latency_ms": 11.49
         }
       },
       {
         "name": "performance",
         "passed": true,
         "detail": {
-          "original_ops_per_s": 890.9,
-          "fix_ops_per_s": 1110.7,
-          "ratio": 1.25,
+          "original_ops_per_s": 949.0,
+          "fix_ops_per_s": 1147.5,
+          "ratio": 1.21,
           "required_ratio": 0.5,
-          "original_p95_ms": 17.59,
-          "fix_p95_ms": 14.01
+          "original_p95_ms": 16.35,
+          "fix_p95_ms": 12.52
         }
       },
       {
@@ -93,8 +93,8 @@
         "detail": "the agent's own reproduction test passed 3/3 runs"
       }
     ],
-    "seconds": 3.9
+    "seconds": 3.7
   },
-  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    import psycopg.errors as pg_errors\n    # Try several independent keys; any double-charge proves the bug.\n    # Each round fires N concurrent retries of the same idempotency key.\n    for rnd in range(5):\n        key = f\"repro-key-{rnd}\"\n        account_id = 1\n        amount = 10\n        n = 8\n        barrier = threading.Barrier(n)\n        results = [None] * n\n\n        def worker(i):\n            try:\n                with connect() as conn:\n                    barrier.wait()\n                    try:\n                        results[i] = service.pay(conn, key, account_id, amount)\n                    except (pg_errors.DeadlockDetected, pg_errors.SerializationFailure, pg_errors.UniqueViolation, pg_errors.CheckViolation) as e:\n                        results[i] = e\n            except Exception as e:\n                try:\n                    results[i] = e\n                except Exception:\n                    pass\n\n        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]\n        for t in threads:\n            t.start()\n        for t in threads:\n            t.join()\n\n        true_count = sum(1 for r in results if r is True)\n        # check DB row count\n        try:\n            with connect() as conn:\n                row = conn.execute(\"SELECT COUNT(*) FROM payments WHERE idempotency_key = %s\", (key,)).fetchone()\n                db_count = row[0] if row else 0\n        except Exception:\n            continue\n\n        if db_count > 1 or true_count > 1:\n            return f\"idempotency violated: payment {key} was charged {db_count} times ({true_count} callers returned True), must be charged exactly once\"\n    return None\n",
-  "fix_code": "\"\"\"Payment service with idempotency keys.\n\nClients retry on timeouts, so the same payment request (same idempotency key)\ncan arrive more than once. Each key must be charged exactly once.\n\nThe service may define MIGRATIONS, a list of SQL statements applied after\nschema.sql when the database is set up.\n\"\"\"\nimport psycopg\n\nMIGRATIONS: list[str] = [\n    \"CREATE UNIQUE INDEX IF NOT EXISTS payments_idempotency_key_uidx ON payments (idempotency_key)\",\n]\n\n\ndef pay(conn: psycopg.Connection, idempotency_key: str, account_id: int, amount: int) -> bool:\n    \"\"\"Charge the account once per key. Returns True if charged, False if the key was already processed.\"\"\"\n    with conn.transaction():\n        res = conn.execute(\n            \"INSERT INTO payments (idempotency_key, account_id, amount) VALUES (%s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id\",\n            (idempotency_key, account_id, amount),\n        ).fetchone()\n        if res is None:\n            return False\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, account_id))\n        return True\n"
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    key = \"repro-idempotency-key\"\n    account_id = 1\n    # discover a safe amount that won't violate CHECK(balance>=0)\n    try:\n        with connect() as c:\n            row = c.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n            init_bal = row[0] if row else 1000000\n    except Exception:\n        init_bal = 1000000\n    if init_bal is None:\n        init_bal = 1000000\n    # use amount 1 if we can afford N charges, else 0 (still detects duplicate rows)\n    N = 20\n    amount = 1 if init_bal >= N else 0\n\n    barrier = threading.Barrier(N)\n    results = []\n    errors = []\n\n    def worker():\n        try:\n            with connect() as conn:\n                barrier.wait()\n                try:\n                    r = service.pay(conn, key, account_id, amount)\n                    results.append(r)\n                except Exception as e:\n                    errors.append(repr(e))\n        except Exception as e:\n            errors.append(repr(e))\n\n    threads = [threading.Thread(target=worker) for _ in range(N)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join()\n\n    # ground truth from DB\n    try:\n        with connect() as conn:\n            cnt = conn.execute(\n                \"SELECT COUNT(*) FROM payments WHERE idempotency_key = %s\", (key,)\n            ).fetchone()[0]\n            bal = conn.execute(\n                \"SELECT balance FROM accounts WHERE id = %s\", (account_id,)\n            ).fetchone()[0]\n    except Exception as e:\n        return f\"could not verify DB state: {e!r} results={results} errors={errors}\"\n\n    true_count = sum(1 for x in results if x is True)\n    false_count = sum(1 for x in results if x is False)\n\n    if cnt != 1:\n        return (\n            f\"idempotency violated: payment {key!r} charged {cnt} times (expected 1); \"\n            f\"True returns={true_count}/{N}, errors={len(errors)}, balance={bal} init={init_bal}\"\n        )\n    if true_count != 1 or false_count != N - 1:\n        return (\n            f\"idempotency return-value violated: expected exactly 1 True and {N-1} False, \"\n            f\"got {true_count} True / {false_count} False (rows={cnt}) errors={errors}\"\n        )\n    # also check balance movement matches exactly one charge\n    expected_bal = init_bal - amount\n    if bal != expected_bal:\n        return (\n            f\"balance violated: expected {expected_bal} after single charge of {amount}, got {bal} \"\n            f\"(init={init_bal}, rows={cnt})\"\n        )\n    return None\n",
+  "fix_code": "\"\"\"Payment service with idempotency keys.\n\nClients retry on timeouts, so the same payment request (same idempotency key)\ncan arrive more than once. Each key must be charged exactly once.\n\nThe service may define MIGRATIONS, a list of SQL statements applied after\nschema.sql when the database is set up.\n\"\"\"\nimport psycopg\n\nMIGRATIONS: list[str] = [\n    \"CREATE UNIQUE INDEX IF NOT EXISTS payments_idempotency_key_uidx ON payments (idempotency_key)\",\n]\n\n\ndef pay(conn: psycopg.Connection, idempotency_key: str, account_id: int, amount: int) -> bool:\n    \"\"\"Charge the account once per key. Returns True if charged, False if the key was already processed.\"\"\"\n    with conn.transaction():\n        res = conn.execute(\n            \"INSERT INTO payments (idempotency_key, account_id, amount) VALUES (%s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING RETURNING 1\",\n            (idempotency_key, account_id, amount),\n        ).fetchone()\n        if res is None:\n            return False\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, account_id))\n        return True\n"
 }

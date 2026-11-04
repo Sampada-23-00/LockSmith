@@ -1,6 +1,5 @@
-DROP TABLE IF EXISTS payments, accounts;
+DROP TABLE IF EXISTS payments, withdrawals, accounts;
 
--- No CHECK constraint: the "no overdraft" rule is enforced by the application.
 CREATE TABLE accounts (
     id      INT PRIMARY KEY,
     owner   TEXT NOT NULL,

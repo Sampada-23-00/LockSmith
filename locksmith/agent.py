@@ -39,7 +39,7 @@ Workflow:
    - The database is freshly reset before each call (64 accounts, ids 1..64, see schema.sql for the start
      state). Use threading.Barrier to start requests at the same instant so the race happens every time.
    - Return a short description of the money rule that broke, or None if everything held. Catch the
-     exceptions you expect (for example psycopg.errors.DeadlockDetected) instead of letting them escape.
+     exceptions you expect (from the service or psycopg.errors) instead of letting them escape.
    run_repro accepts the test only if it catches the bug on every run against the original code and never
    reports a problem against a correct implementation. Iterate until it is valid.
 5. Write a complete replacement for service.py with write_candidate.
@@ -48,7 +48,7 @@ Workflow:
    - Fix the concurrency bug without serialising unrelated requests (no table locks or global locks):
      throughput is measured.
    - Do not rely on SERIALIZABLE or NOWAIT unless you also retry, because errors count as failures.
-   - If you need schema changes (for example a unique index), define MIGRATIONS = [sql, ...] in service.py.
+   - If you need schema changes, define MIGRATIONS = [sql, ...] in service.py; they run after schema.sql.
 6. Call run_verification for feedback. If any check fails, read why, revise and test again.
 7. When verification passes, call submit_fix. An independent verifier re-tests on unseen workloads and
    runs your reproduction test against the fix; if it rejects the fix, keep working.

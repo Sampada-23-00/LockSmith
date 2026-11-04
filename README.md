@@ -8,7 +8,7 @@ Built for the Meta Global AI Developer Hackathon (Indie track), Oct 27 – Nov 4
 
 AI coding agents verify fixes by rerunning tests. Concurrency bugs only appear under particular timings, so a test can pass by luck. In payment systems that luck costs real money. LockSmith never lets the agent judge its own work.
 
-## The benchmark: four real fintech concurrency bugs on PostgreSQL
+## The benchmark: six real fintech concurrency bugs on PostgreSQL
 
 | Scenario | What goes wrong | Reproduced (6 seeds) |
 |---|---|---|
@@ -16,19 +16,25 @@ AI coding agents verify fixes by rerunning tests. Concurrency bugs only appear u
 | `lost_update` | Balance read into the app and written back; concurrent updates vanish | 6/6 |
 | `overdraft` | Balance check and debit not atomic; accounts go negative | 6/6 |
 | `double_spend` | Idempotency check is a plain SELECT; client retries charge twice | 6/6 |
+| `joint_account` | Each partner locks only their own account while checking the household total; the household goes negative (write skew) | 6/6 |
+| `daily_limit` | The daily total is summed from rows that concurrent requests have not inserted yet; the limit is exceeded (phantom) | 6/6 |
 
 Each buggy service lives in `benchmark/<scenario>/` (what the agent may read and replace). Workloads and money checks live in `locksmith/scenarios.py` (never shown to the agent).
 
-## Results (Muse Spark 1.3)
+## Results (Muse Spark 1.3, no hints in the code)
 
-| Bug | Agent's reproduction test | Fix attempts | Independent verdict | Cost |
+| Bug | Reproduction tests written | Fix attempts | Independent verdict | Cost |
 |---|---|---|---|---|
-| Deadlock | valid on 1st try | 1 | accepted (6/6 checks) | $0.056 |
-| Lost update | valid on 1st try | 1 | accepted (6/6 checks) | $0.055 |
-| Overdraft | 1st test caught the bug only 1/3 runs and was **rejected as unreliable**; 2nd caught it 3/3 | 1 | accepted (6/6 checks) | $0.065 |
-| Double spend | valid on 1st try | 1 | accepted (6/6 checks) | $0.054 |
+| Deadlock | 3 (first two rejected as unreliable) | 1 | accepted (6/6 checks) | $0.15 |
+| Lost update | 2 | 1 | accepted (6/6 checks) | $0.16 |
+| Overdraft | 2 | 1 | accepted (6/6 checks) | $0.18 |
+| Double spend | 1 | 1 | accepted (6/6 checks) | $0.05 |
+| Household overdraft (write skew) | 1 | 1 | accepted (6/6 checks) | $0.07 |
+| Daily limit bypass (phantom) | 1 | 1 | accepted (6/6 checks) | $0.07 |
 
-4/4 bugs fixed autonomously for **$0.23** in total. Full transcripts, the agent's tests and fixes are in `results/`.
+6/6 bugs fixed autonomously for **$0.69** in total. The benchmark services carry no comments describing their bugs. Full transcripts, the agent's tests and fixes are in `results/`.
+
+The two harder bugs have an obvious fix that is wrong, and the verifier rejects both: locking the partner's account too deadlocks under load, and locking today's withdrawal rows cannot stop new rows from being inserted. The agent avoided both.
 
 ## How the agent works (Muse Spark, tool calling)
 
@@ -57,6 +63,45 @@ The verifier is itself tested (`tests/test_harness.py`): it reproduces every bug
 | Lock the whole table | No more deadlocks | performance (6× slower) |
 | Reject every withdrawal | No account can go negative | same behaviour |
 | SERIALIZABLE without retry | No lost updates | under load (customers get errors) |
+| Also lock the partner's account | Both household rows are locked | under load (deadlocks) |
+| Lock today's withdrawal rows | The rows being summed are locked | under load (limit still exceeded) |
+
+## From prototype to production
+
+LockSmith today is a working prototype on six self-contained services. This is how it maps to a real payments stack, and what is not solved yet.
+
+| Today | In production |
+|---|---|
+| One `service.py` per bug | The agent gets code search over the real repository; the verifier drives the service through its API, so the language and ORM don't matter |
+| Embedded Postgres with seeded accounts | A disposable copy built from the company's own migrations, with synthetic or anonymised data. **The verifier never touches the production database** |
+| Workloads written per scenario | Workloads derived from production traffic shape (which accounts are hot, how requests overlap), anonymised |
+| Money rules written in Python | Rules as configuration owned by finance/risk: balance never negative, one charge per end-to-end id, daily limits |
+| "Accepted" | A pull request with the evidence attached (reproduction test, before/after numbers, verdict) for human review, then normal CI and staged rollout. **Nothing is auto-deployed** |
+| Hosted Muse Spark via the Meta Model API | Banks that cannot send code outside can self-host Meta's open-weight models (Muse Spark Open, Muse Glimmer) behind the same OpenAI-compatible interface |
+
+**Limitations, stated plainly**
+
+- Testing shows a bug exists; it cannot prove one is impossible. LockSmith reduces luck (3/3 reproduction, barrier-synchronised tests, held-out workloads, every-write audits) but its verdict is strong evidence, not a formal proof.
+- Scope is concurrency inside one PostgreSQL database. Cross-service races (queues, sagas, read replicas) are out of scope.
+- The six bugs are planted, so ground truth is known. The service code carries no hints, the workloads and money checks are hidden from the agent, and two bugs are traps where the obvious fix is wrong.
+
+## Standards mapping
+
+| LockSmith | Industry standard |
+|---|---|
+| Amounts stored as integer paise | ISO 4217 minor units (INR, exponent 2); no floating point anywhere |
+| `idempotency_key` on payments | ISO 20022 `EndToEndId` / UETR: the identifier that lets a retried payment be recognised as the same payment |
+| Transfer, withdrawal and payment flows | ISO 20022 credit transfer (`pacs.008`) and customer payment initiation (`pain.001`) |
+
+## FAQ
+
+**Aren't these toy bugs?** They are small on purpose: a benchmark needs known ground truth. Each one is a real, documented failure mode in payment systems, reproduces on every seed, and two have tempting wrong fixes the verifier rejects.
+
+**Why not just use SERIALIZABLE everywhere?** Without retries, clients get serialization errors under load; the verifier rejects that fix. With retries it can be valid, and the agent is free to choose it.
+
+**Can the agent game the verifier?** It never sees the workloads, the money checks or the held-out seeds, cannot read the harness code, and its own reproduction test must fail on the original code and pass on a correct implementation before it counts.
+
+**What does it cost?** About $0.12 (roughly ₹10) per bug with Muse Spark, measured in `results/`.
 
 ## Quick start
 

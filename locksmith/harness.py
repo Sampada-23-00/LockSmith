@@ -104,6 +104,10 @@ def snapshot() -> dict:
             state["payments"] = conn.execute(
                 "SELECT idempotency_key, account_id, amount FROM payments ORDER BY idempotency_key, id"
             ).fetchall()
+        if conn.execute("SELECT to_regclass('withdrawals')").fetchone()[0]:
+            state["withdrawals"] = conn.execute(
+                "SELECT account_id, amount, day FROM withdrawals ORDER BY account_id, id"
+            ).fetchall()
         return state
 
 
@@ -155,7 +159,8 @@ def run_workload(scenario: Scenario, service_path: Path, plan: Plan) -> dict:
         negative = conn.execute(
             "SELECT account_id, COUNT(*), MIN(balance) FROM locksmith_audit GROUP BY 1 ORDER BY 1"
         ).fetchall()
-        problems += [f"account {a} went negative {n} times (lowest balance {low})" for a, n, low in negative]
+        if not scenario.negative_balances_allowed:
+            problems += [f"account {a} went negative {n} times (lowest balance {low})" for a, n, low in negative]
         problems += scenario.check(conn, results, start)
 
     latencies = sorted(r["latency"] for r in results)

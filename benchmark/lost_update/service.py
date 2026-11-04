@@ -1,9 +1,4 @@
-"""Wallet service: top-ups and spends on a customer's wallet.
-
-Planted bug (lost update): the balance is read into Python, changed there, and
-written back as an absolute value. Two requests that read the same old balance
-both write, and one of the changes silently disappears.
-"""
+"""Wallet service: top-ups and spends on a customer's wallet."""
 import psycopg
 
 

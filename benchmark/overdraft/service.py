@@ -1,9 +1,4 @@
-"""Withdrawal service for accounts without an overdraft facility.
-
-Planted bug (overdraft race): the balance check and the debit are separate steps
-with no lock in between. Two withdrawals can both pass the check against the
-same balance, and the account goes negative.
-"""
+"""Withdrawal service for accounts without an overdraft facility."""
 import psycopg
 
 

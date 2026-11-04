@@ -3,10 +3,6 @@
 Clients retry on timeouts, so the same payment request (same idempotency key)
 can arrive more than once. Each key must be charged exactly once.
 
-Planted bug (double spend): "has this key been processed?" is checked with a
-plain SELECT before inserting. Two retries arriving together both see nothing,
-and the customer is charged twice.
-
 The service may define MIGRATIONS, a list of SQL statements applied after
 schema.sql when the database is set up.
 """

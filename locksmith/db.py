@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pgserver
 import psycopg
+from pgserver.postgres_server import PostgresServer
 
 ROOT = Path(__file__).resolve().parent.parent
 PGDATA = ROOT / "pgdata"
@@ -21,8 +22,12 @@ def server():
     deadline = time.monotonic() + STARTUP_WAIT_S
     while True:
         try:
-            return pgserver.get_server(PGDATA, cleanup_mode=None)
+            instance = pgserver.get_server(PGDATA, cleanup_mode=None)
+            instance.get_uri()  # raises on a half-started instance
+            return instance
         except (AssertionError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            # pgserver caches the instance even when startup failed; drop it so a retry reconnects
+            PostgresServer._instances.clear()
             if time.monotonic() > deadline:
                 break
             time.sleep(3)

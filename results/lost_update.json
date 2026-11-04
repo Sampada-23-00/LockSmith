@@ -2,21 +2,21 @@
   "scenario": "lost_update",
   "title": "Lost update in wallet top-ups",
   "model": "muse-spark-1.3",
-  "finished_at": "2026-11-02T20:38:11",
+  "finished_at": "2026-11-03T16:28:42",
   "accepted": true,
   "aborted": null,
-  "repro_attempts": 1,
+  "repro_attempts": 2,
   "fix_attempts": 1,
   "verification_runs": 1,
   "submissions": 1,
-  "seconds": 159.8,
-  "cost_usd": 0.055,
-  "root_cause": "Lost update: deposit/withdraw read the balance into Python (SELECT) then wrote an absolute value (UPDATE balance = old +/- amount). Two concurrent transactions read the same old balance and both wrote back, so one update silently overwrote the other and money appeared/disappeared. Fix is atomic in-database increments with a conditional withdraw.",
-  "fix": "Replaced read-modify-write with single atomic UPDATE statements: deposit uses UPDATE ... SET balance = balance + amount, withdraw uses UPDATE ... WHERE balance >= amount and checks rowcount (falling back to SELECT only to distinguish unknown account from InsufficientFunds). Row-level write lock makes concurrent updates serialize without lost updates, errors, or extra locking.",
+  "seconds": 172.4,
+  "cost_usd": 0.1571,
+  "root_cause": "Lost update from SELECT-then-UPDATE race: deposit/withdraw both read balance then write balance +/- amount computed from the stale read. Two concurrent txns read the same old balance (e.g., both read 100), then each writes old +/- amount, so one overwrites the other (both write 200 instead of 300). The second UPDATE blocks on the first's row lock but still uses its stale read, so committed balances fall short of the sum of successful ops.",
+  "fix": "Replaced read-modify-write (SELECT then UPDATE with client-computed value) with single atomic UPDATE statements: deposit uses UPDATE ... SET balance = balance + %s; withdraw uses conditional UPDATE ... SET balance = balance - %s WHERE balance >= %s and distinguishes unknown-account vs InsufficientFunds with a follow-up SELECT only on failure. The atomic UPDATE holds the row lock while computing, so concurrent increments/decrements serialize correctly without extra locking.",
   "repro_report": {
     "detects_bug_in_original_code": "3/3",
     "false_alarms_on_a_correct_implementation": "0/3",
-    "example_violation": "lost update: account 1 balance is 100100 but successful deposits add up to 103200 (initial 100000, 32x100)",
+    "example_violation": "lost update: account 1 balance is 107700 but 80 successful deposits of 100 from 100000 should give 108000",
     "errors": [],
     "valid": true
   },
@@ -40,9 +40,9 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.502,
-          "throughput_ops_per_s": 955.5,
-          "p95_latency_ms": 14.76
+          "seconds": 0.302,
+          "throughput_ops_per_s": 1591.4,
+          "p95_latency_ms": 8.74
         }
       },
       {
@@ -55,9 +55,9 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.539,
-          "throughput_ops_per_s": 889.9,
-          "p95_latency_ms": 12.02
+          "seconds": 0.303,
+          "throughput_ops_per_s": 1582.2,
+          "p95_latency_ms": 9.19
         }
       },
       {
@@ -70,21 +70,21 @@
           "deadlock": 0,
           "error": 0,
           "problems": [],
-          "seconds": 0.488,
-          "throughput_ops_per_s": 983.7,
-          "p95_latency_ms": 17.1
+          "seconds": 0.304,
+          "throughput_ops_per_s": 1578.5,
+          "p95_latency_ms": 8.55
         }
       },
       {
         "name": "performance",
         "passed": true,
         "detail": {
-          "original_ops_per_s": 747.9,
-          "fix_ops_per_s": 956.4,
-          "ratio": 1.28,
+          "original_ops_per_s": 1220.2,
+          "fix_ops_per_s": 1404.1,
+          "ratio": 1.15,
           "required_ratio": 0.5,
-          "original_p95_ms": 20.23,
-          "fix_p95_ms": 13.06
+          "original_p95_ms": 10.74,
+          "fix_p95_ms": 8.34
         }
       },
       {
@@ -93,8 +93,8 @@
         "detail": "the agent's own reproduction test passed 3/3 runs"
       }
     ],
-    "seconds": 4.4
+    "seconds": 2.9
   },
-  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    AID = 1\n    AMT = 100\n    N = 32\n    with connect() as conn:\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (AID,)).fetchone()\n        initial = row[0]\n    barrier = threading.Barrier(N)\n    ok = 0\n    lock = threading.Lock()\n    def worker():\n        nonlocal ok\n        with connect() as conn:\n            try:\n                barrier.wait(timeout=15)\n            except Exception:\n                return\n            try:\n                service.deposit(conn, AID, AMT)\n            except Exception:\n                return\n            with lock:\n                ok += 1\n    threads = [threading.Thread(target=worker) for _ in range(N)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join()\n    with connect() as conn:\n        final = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (AID,)).fetchone()[0]\n    expected = initial + ok * AMT\n    if final != expected:\n        return f\"lost update: account {AID} balance is {final} but successful deposits add up to {expected} (initial {initial}, {ok}x{AMT})\"\n    return None\n",
-  "fix_code": "\"\"\"Wallet service: top-ups and spends on a customer's wallet.\"\"\"\nimport psycopg\n\nMIGRATIONS = []\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef _read_balance(conn: psycopg.Connection, account_id: int) -> int:\n    row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n    if row is None:\n        raise ValueError(\"unknown account\")\n    return row[0]\n\n\ndef deposit(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance + %s WHERE id = %s\",\n            (amount, account_id),\n        )\n        if cur.rowcount == 0:\n            raise ValueError(\"unknown account\")\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s WHERE id = %s AND balance >= %s\",\n            (amount, account_id, amount),\n        )\n        if cur.rowcount == 1:\n            return\n        # 0 rows: either unknown account or insufficient funds\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n        if row is None:\n            raise ValueError(\"unknown account\")\n        raise InsufficientFunds(account_id)\n"
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    ACCT = 1\n    NTHREADS = 16\n    PER_THREAD = 5\n    AMOUNT = 100\n\n    try:\n        with connect() as conn:\n            row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (ACCT,)).fetchone()\n            if row is None:\n                return None\n            initial = row[0]\n    except Exception:\n        return None\n\n    barrier = threading.Barrier(NTHREADS)\n    state_lock = threading.Lock()\n    ok_count = [0]\n    err_count = [0]\n\n    def worker():\n        try:\n            barrier.wait()\n        except Exception:\n            pass\n        for _ in range(PER_THREAD):\n            conn = None\n            try:\n                with connect() as c:\n                    service.deposit(c, ACCT, AMOUNT)\n                    with state_lock:\n                        ok_count[0] += 1\n            except Exception:\n                with state_lock:\n                    err_count[0] += 1\n\n    threads = [threading.Thread(target=worker) for _ in range(NTHREADS)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join()\n\n    # If anything errored, treat as inconclusive to avoid false alarms.\n    if err_count[0] > 0:\n        return None\n    total = NTHREADS * PER_THREAD\n    if ok_count[0] != total:\n        return None\n\n    try:\n        with connect() as conn:\n            row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (ACCT,)).fetchone()\n            final = row[0]\n    except Exception:\n        return None\n\n    expected = initial + total * AMOUNT\n    if final != expected:\n        return f\"lost update: account {ACCT} balance is {final} but {total} successful deposits of {AMOUNT} from {initial} should give {expected}\"\n    return None\n",
+  "fix_code": "\"\"\"Wallet service: top-ups and spends on a customer's wallet.\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef _read_balance(conn: psycopg.Connection, account_id: int) -> int:\n    row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n    if row is None:\n        raise ValueError(\"unknown account\")\n    return row[0]\n\n\ndef deposit(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance + %s WHERE id = %s\",\n            (amount, account_id),\n        )\n        if cur.rowcount == 0:\n            raise ValueError(\"unknown account\")\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        cur = conn.execute(\n            \"UPDATE accounts SET balance = balance - %s WHERE id = %s AND balance >= %s\",\n            (amount, account_id, amount),\n        )\n        if cur.rowcount == 1:\n            return\n        # Either unknown account or insufficient funds; distinguish\n        # with a follow-up read (only on the failure path).\n        row = conn.execute(\"SELECT balance FROM accounts WHERE id = %s\", (account_id,)).fetchone()\n        if row is None:\n            raise ValueError(\"unknown account\")\n        raise InsufficientFunds(account_id)\n"
 }

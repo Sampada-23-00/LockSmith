@@ -31,6 +31,7 @@ class Scenario:
     start_balance: int = 1_000_00
     num_accounts: int = 64
     business_errors: tuple[str, ...] = ("InsufficientFunds",)
+    negative_balances_allowed: bool = False  # e.g. one partner may dip below zero within a household
 
     @property
     def target_dir(self) -> Path:
@@ -190,6 +191,67 @@ def _payments_check(conn, results, start):
     return problems
 
 
+# --- 5. Write skew: shared household overdraft rule ------------------------------
+
+def _household_contended(seed, workers, ops):
+    # Two workers per household, one per partner, both spending at the same time.
+    # Withdrawals only, so a household total that ever went negative stays negative at the end.
+    def op(rng, w, j):
+        household = w // 2 + 1
+        return ("withdraw", {"account_id": 2 * household - 1 + w % 2, "amount": rng.randint(100, 300)})
+
+    return _per_worker(seed, workers, op, ops)
+
+
+def _household_calm(seed, workers, ops):
+    def op(rng, w, j):
+        account = 2 * w + 1 + j % 2  # both partners of the worker's own household
+        return (rng.choice(["deposit", "withdraw"]), {"account_id": account, "amount": rng.randint(1, 5)})
+
+    return _per_worker(seed, workers, op, ops)
+
+
+def _household_check(conn, results, start):
+    problems = [
+        f"household {h} (accounts {2 * h - 1}+{2 * h}) is overdrawn: combined balance {total}"
+        for h, total in conn.execute(
+            "SELECT household, SUM(balance) FROM accounts GROUP BY household HAVING SUM(balance) < 0 ORDER BY 1"
+        )
+    ]
+    return problems + ledger_check(_wallet_effects)(conn, results, start)
+
+
+# --- 6. Phantom: daily limit summed over rows that don't exist yet ----------------
+
+DAILY_LIMIT = 5_000  # must match benchmark/daily_limit/service.py
+
+
+def _daily_contended(seed, workers, ops):
+    def op(rng, w, j):
+        return ("withdraw", {"account_id": rng.randint(1, 4), "amount": rng.randint(500, 1_500)})
+
+    return _per_worker(seed, workers, op, ops)
+
+
+def _daily_calm(seed, workers, ops):
+    def op(rng, w, j):
+        return ("withdraw", {"account_id": w + 1, "amount": rng.randint(1, 10)})
+
+    return _per_worker(seed, workers, op, ops)
+
+
+def _daily_check(conn, results, start):
+    problems = [
+        f"account {a} withdrew {total} today, above the daily limit of {DAILY_LIMIT}"
+        for a, total in conn.execute(
+            "SELECT account_id, SUM(amount) FROM withdrawals WHERE day = current_date "
+            "GROUP BY account_id HAVING SUM(amount) > %s ORDER BY 1",
+            (DAILY_LIMIT,),
+        )
+    ]
+    return problems + ledger_check(_wallet_effects)(conn, results, start)
+
+
 SCENARIOS = {
     s.name: s
     for s in [
@@ -229,6 +291,27 @@ SCENARIOS = {
             contended=_payments_contended,
             calm=_payments_calm,
             check=_payments_check,
+        ),
+        Scenario(
+            name="joint_account",
+            title="Household overdraft (write skew)",
+            incident="Some households have a negative combined balance, which our rules forbid. Each withdrawal "
+            "checks the household's combined balance and locks the account it debits.",
+            contended=_household_contended,
+            calm=_household_calm,
+            check=_household_check,
+            start_balance=1_000,
+            negative_balances_allowed=True,
+        ),
+        Scenario(
+            name="daily_limit",
+            title="Daily withdrawal limit bypass (phantom)",
+            incident="Risk team found accounts that withdrew more than the ₹50 daily limit in one day. Every "
+            "withdrawal checks today's total before it is approved.",
+            contended=_daily_contended,
+            calm=_daily_calm,
+            check=_daily_check,
+            business_errors=("DailyLimitExceeded",),
         ),
     ]
 }

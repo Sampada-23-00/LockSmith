@@ -33,6 +33,9 @@ def test_reference_fix_is_accepted(scenario):
         ("deadlock", "deadlock_table_lock.py", "performance"),
         ("overdraft", "overdraft_reject_all.py", "same_behaviour"),
         ("lost_update", "lost_update_serializable.py", "under_load_seed_1"),
+        ("joint_account", "joint_account_partner_lock.py", "under_load_seed_1"),
+        ("daily_limit", "daily_limit_lock_rows.py", "under_load_seed_1"),
+        ("double_spend", "double_spend_unique_no_conflict.py", "under_load_seed_1"),
     ],
 )
 def test_bad_fix_is_rejected_for_the_right_reason(scenario, bad_fix, failing_check):

@@ -1,8 +1,4 @@
-"""Money transfer service.
-
-Planted bug (deadlock): rows are locked in request order (sender first, then
-receiver), so A->B and B->A running at the same time wait on each other forever.
-"""
+"""Money transfer service."""
 import psycopg
 
 

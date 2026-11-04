@@ -1,0 +1,100 @@
+{
+  "scenario": "double_spend",
+  "title": "Double charge on payment retries",
+  "model": "muse-wonder-1.0",
+  "finished_at": "2026-11-03T17:17:35",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 165.0,
+  "cost_usd": 0.2591,
+  "root_cause": "At default READ COMMITTED isolation, the original check-then-insert sequence is not atomic: two concurrent pay calls with the same idempotency key can both run SELECT, both observe no payment, and both INSERT and deduct because the pre-existing index is non-unique. Each duplicate insert commits a separate charge, breaking exactly-once billing for retries with the same key.",
+  "fix": "Add a UNIQUE index on payments.idempotency_key via MIGRATIONS and create the payment with INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING id in the same transaction. Only transactions that actually claim the key update the account; if the atomic insert returns no row, the key was already processed and pay returns False. Otherwise pay updates the balance and returns True. This preserves the original sequential behavior including returning False for a committed duplicate. Unrelated keys never block because the unique index only contends on the same key.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "payment repro-double-charge-key-1 was charged 16 times (16 calls returned True, payments rows=16) for one idempotency key",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "double_spend",
+    "candidate": "workspace\\double_spend\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.69,
+          "throughput_ops_per_s": 695.4,
+          "p95_latency_ms": 20.76
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.71,
+          "throughput_ops_per_s": 675.8,
+          "p95_latency_ms": 22.04
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 480,
+          "rejected": 0,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.774,
+          "throughput_ops_per_s": 619.9,
+          "p95_latency_ms": 21.45
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 534.9,
+          "fix_ops_per_s": 528.9,
+          "ratio": 0.99,
+          "required_ratio": 0.5,
+          "original_p95_ms": 32.22,
+          "fix_p95_ms": 31.37
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 6.0
+  },
+  "repro_code": "import threading\n\n\ndef reproduce(connect, service) -> str | None:\n    key = \"repro-double-charge-key-1\"\n    account_id = 1\n    amount = 10\n    n = 16\n\n    # Starting balance for the account under test.\n    try:\n        with connect() as conn:\n            row = conn.execute(\n                \"SELECT balance FROM accounts WHERE id = %s\", (account_id,)\n            ).fetchone()\n            balance_before = row[0] if row else None\n    except Exception:\n        balance_before = None\n\n    barrier = threading.Barrier(n)\n    lock = threading.Lock()\n    results = []\n    errors = []\n\n    def worker():\n        try:\n            with connect() as conn:\n                barrier.wait(timeout=15)\n                try:\n                    result = service.pay(conn, key, account_id, amount)\n                except Exception as exc:  # expected exceptions are recorded, not escaped\n                    with lock:\n                        errors.append(repr(exc))\n                    return\n                with lock:\n                    results.append(result)\n        except Exception as exc:\n            with lock:\n                errors.append(repr(exc))\n\n    threads = [threading.Thread(target=worker) for _ in range(n)]\n    for t in threads:\n        t.start()\n    for t in threads:\n        t.join(timeout=30)\n\n    try:\n        with connect() as conn:\n            cnt = conn.execute(\n                \"SELECT COUNT(*) FROM payments WHERE idempotency_key = %s\", (key,)\n            ).fetchone()[0]\n            row = conn.execute(\n                \"SELECT balance FROM accounts WHERE id = %s\", (account_id,)\n            ).fetchone()\n            balance_after = row[0] if row else None\n    except Exception as exc:\n        return f\"could not verify payment count for {key}: {exc!r}\"\n\n    true_count = sum(1 for r in results if r is True)\n\n    if cnt > 1 or true_count > 1:\n        return (\n            f\"payment {key} was charged {cnt} times \"\n            f\"({true_count} calls returned True, payments rows={cnt}) for one idempotency key\"\n        )\n\n    if balance_before is not None and balance_after is not None:\n        deducted = balance_before - balance_after\n        if cnt == 1 and deducted != amount:\n            return (\n                f\"payment {key} recorded once but balance deducted {deducted} \"\n                f\"instead of {amount}\"\n            )\n        if cnt > 1:\n            return f\"payment {key} was charged {cnt} times\"\n\n    return None\n",
+  "fix_code": "\"\"\"Payment service with idempotency keys.\n\nClients retry on timeouts, so the same payment request (same idempotency key)\ncan arrive more than once. Each key must be charged exactly once.\n\nThe service may define MIGRATIONS, a list of SQL statements applied after\nschema.sql when the database is set up.\n\"\"\"\nimport psycopg\n\nMIGRATIONS: list[str] = [\n    \"CREATE UNIQUE INDEX IF NOT EXISTS payments_idempotency_key_unique_idx \"\n    \"ON payments (idempotency_key)\",\n]\n\n\ndef pay(conn: psycopg.Connection, idempotency_key: str, account_id: int, amount: int) -> bool:\n    \"\"\"Charge the account once per key. Returns True if charged, False if the key was already processed.\"\"\"\n    with conn.transaction():\n        # Fast path preserving the original sequential semantics for a key\n        # that has already committed (return False without touching any\n        # other account/payment data).\n        seen = conn.execute(\n            \"SELECT 1 FROM payments WHERE idempotency_key = %s\", (idempotency_key,)\n        ).fetchone()\n        if seen:\n            return False\n        # Atomically claim the key. The unique index makes this race-free:\n        # if a concurrent transaction has already inserted (but not yet\n        # committed) the same key, this waits for it and then does nothing\n        # instead of inserting a duplicate. Unrelated keys never block.\n        inserted = conn.execute(\n            \"INSERT INTO payments (idempotency_key, account_id, amount) \"\n            \"VALUES (%s, %s, %s) \"\n            \"ON CONFLICT (idempotency_key) DO NOTHING RETURNING id\",\n            (idempotency_key, account_id, amount),\n        ).fetchone()\n        if inserted is None:\n            return False\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, account_id))\n        return True\n"
+}

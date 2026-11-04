@@ -1,4 +1,4 @@
-DROP TABLE IF EXISTS payments, accounts;
+DROP TABLE IF EXISTS payments, withdrawals, accounts;
 
 CREATE TABLE accounts (
     id      INT PRIMARY KEY,

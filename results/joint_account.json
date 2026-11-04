@@ -1,0 +1,100 @@
+{
+  "scenario": "joint_account",
+  "title": "Household overdraft (write skew)",
+  "model": "muse-spark-1.3",
+  "finished_at": "2026-11-03T16:44:22",
+  "accepted": true,
+  "aborted": null,
+  "repro_attempts": 1,
+  "fix_attempts": 1,
+  "verification_runs": 1,
+  "submissions": 1,
+  "seconds": 184.0,
+  "cost_usd": 0.0738,
+  "root_cause": "withdraw locked only the debited account row but checked the household combined balance with an unlocked SUM, so two concurrent withdrawals on the two partners of the same household both read the same pre-withdrawal combined balance and both succeeded, driving the combined balance negative.",
+  "fix": "Lock the whole household (both accounts ORDER BY id FOR UPDATE) before checking the combined balance, computing SUM from the locked rows.",
+  "repro_report": {
+    "detects_bug_in_original_code": "3/3",
+    "false_alarms_on_a_correct_implementation": "0/3",
+    "example_violation": "household 3 overdrawn: combined balance -2000 < 0 (joint overdraft rule broken)",
+    "errors": [],
+    "valid": true
+  },
+  "verdict": {
+    "scenario": "joint_account",
+    "candidate": "workspace\\joint_account\\c1_service.py",
+    "passed": true,
+    "checks": [
+      {
+        "name": "same_behaviour",
+        "passed": true,
+        "detail": "40 sequential requests matched the original exactly"
+      },
+      {
+        "name": "under_load_seed_101",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 82,
+          "rejected": 398,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.421,
+          "throughput_ops_per_s": 1139.9,
+          "p95_latency_ms": 13.87
+        }
+      },
+      {
+        "name": "under_load_seed_102",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 78,
+          "rejected": 402,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.433,
+          "throughput_ops_per_s": 1107.9,
+          "p95_latency_ms": 13.96
+        }
+      },
+      {
+        "name": "under_load_seed_103",
+        "passed": true,
+        "detail": {
+          "operations": 480,
+          "ok": 78,
+          "rejected": 402,
+          "deadlock": 0,
+          "error": 0,
+          "problems": [],
+          "seconds": 0.431,
+          "throughput_ops_per_s": 1112.7,
+          "p95_latency_ms": 14.24
+        }
+      },
+      {
+        "name": "performance",
+        "passed": true,
+        "detail": {
+          "original_ops_per_s": 1089.7,
+          "fix_ops_per_s": 1139.4,
+          "ratio": 1.05,
+          "required_ratio": 0.5,
+          "original_p95_ms": 16.55,
+          "fix_p95_ms": 14.54
+        }
+      },
+      {
+        "name": "agent_reproduction_test",
+        "passed": true,
+        "detail": "the agent's own reproduction test passed 3/3 runs"
+      }
+    ],
+    "seconds": 3.8
+  },
+  "repro_code": "import threading\n\ndef reproduce(connect, service) -> str | None:\n    # Discover accounts and group by household.\n    try:\n        with connect() as conn:\n            rows = conn.execute(\"SELECT id, balance FROM accounts ORDER BY id\").fetchall()\n    except Exception:\n        return None\n    households = {}\n    for _id, _bal in rows:\n        h = (_id + 1) // 2\n        households.setdefault(h, []).append((_id, _bal))\n    targets = []\n    for h in sorted(households):\n        accts = households[h]\n        if len(accts) != 2:\n            continue\n        combined = sum(b for _, b in accts)\n        if combined > 0:\n            targets.append((h, accts[0][0], accts[1][0], combined))\n        if len(targets) >= 8:\n            break\n    if not targets:\n        return None\n    for h, a1, a2, combined in targets:\n        amount = combined\n        barrier = threading.Barrier(2)\n        def do_withdraw(aid):\n            try:\n                with connect() as conn:\n                    try:\n                        barrier.wait(timeout=5)\n                    except Exception:\n                        return\n                    try:\n                        service.withdraw(conn, aid, amount)\n                    except Exception:\n                        pass\n            except Exception:\n                pass\n        t1 = threading.Thread(target=do_withdraw, args=(a1,))\n        t2 = threading.Thread(target=do_withdraw, args=(a2,))\n        t1.start()\n        t2.start()\n        t1.join(timeout=10)\n        t2.join(timeout=10)\n    try:\n        with connect() as conn:\n            bad = conn.execute(\n                \"SELECT household, SUM(balance) FROM accounts GROUP BY household HAVING SUM(balance) < 0\"\n            ).fetchall()\n    except Exception:\n        return None\n    if bad:\n        hh, s = bad[0][0], bad[0][1]\n        return f\"household {hh} overdrawn: combined balance {s} < 0 (joint overdraft rule broken)\"\n    return None\n",
+  "fix_code": "\"\"\"Household accounts with a shared overdraft rule.\n\nPartners in a household each have their own account. One partner may go below\nzero as long as the household's combined balance stays at or above zero.\n\"\"\"\nimport psycopg\n\n\nclass InsufficientFunds(Exception):\n    pass\n\n\ndef deposit(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        conn.execute(\"UPDATE accounts SET balance = balance + %s WHERE id = %s\", (amount, account_id))\n\n\ndef withdraw(conn: psycopg.Connection, account_id: int, amount: int) -> None:\n    with conn.transaction():\n        row = conn.execute(\n            \"SELECT household FROM accounts WHERE id = %s\", (account_id,)\n        ).fetchone()\n        if row is None:\n            raise ValueError(\"unknown account\")\n        hh = row[0]\n        # Lock both accounts of the household in a consistent order so\n        # concurrent withdrawals on either partner serialize without deadlock.\n        # Summing the locked rows gives the current combined balance.\n        locked = conn.execute(\n            \"SELECT balance FROM accounts WHERE household = %s ORDER BY id FOR UPDATE\", (hh,)\n        ).fetchall()\n        combined = sum(r[0] for r in locked)\n        if combined < amount:\n            raise InsufficientFunds(account_id)\n        conn.execute(\"UPDATE accounts SET balance = balance - %s WHERE id = %s\", (amount, account_id))\n"
+}
